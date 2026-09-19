@@ -1,13 +1,11 @@
 # sudo-request
 
-A `sudo` alternative with a human in the loop. Every privileged command
-is routed through a **daemon running in its own terminal window**,
-where you see each request and approve or deny it. Single file,
-standard library only (`sudo-request`, Python 3).
+A `sudo` alternative with a human in the loop: every privileged command
+goes through a **daemon in its own terminal window**, where you approve
+or deny it. Single file, standard library only (Python 3).
 
 > AI was used heavily during development, with human review and testing
-> of all code. This is a personal tool I wanted and I'm sharing it in
-> case it's useful to others.
+> of all code. Personal tool, shared in case it's useful to others.
 
 Ideal with an app like OpenCode where commands get run for you: the
 agent runs `sudo-request …` instead of `sudo …`, and **you** approve
@@ -67,12 +65,10 @@ cp ~/Downloads/SKILL.sudo-request.md \
 **Who is in control:**
 
 - The **daemon runs as you, in your terminal, and answers only to you.**
-  It holds the sudo timestamp, shows every request, and executes. It
-  starts **automatically** on first use (a terminal window pops up) and
-  serves until you close it.
-- The **`sudo-request` command is only a messenger.** It delivers your
-  command to the daemon over a Unix socket and streams stdio back. It
-  cannot approve anything — approval happens exclusively by pressing
+  It holds the sudo timestamp and executes. It starts **automatically**
+  on first use (a terminal window pops up) and serves until you close it.
+- The **`sudo-request` command is only a messenger** over a Unix socket.
+  It cannot approve anything — approval happens exclusively by pressing
   keys in the daemon window.
 - The daemon's control entrypoint is internal and undocumented on
   purpose.
@@ -116,8 +112,7 @@ Letters combine (`-up`). A leading `-p` forces literal treatment:
 | `h` | show the reminder                                             |
 
 The same keys work during an `Allow?` prompt (toggle/show, then ask
-again), so a keystroke can never leak into an answer. While `sudo`
-reads a password, key grabbing pauses so it reaches sudo untouched.
+again). While `sudo` reads a password, key grabbing pauses.
 
 ## Config
 
