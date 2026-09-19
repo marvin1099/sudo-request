@@ -1,0 +1,1695 @@
+#!/usr/bin/env python3
+"""sudo-request: request privileged commands through a persistent daemon.
+
+The daemon runs in its own terminal window. It handles confirmation,
+sudo authentication, execution, auditing and cancellation. Clients
+connect over a Unix domain socket.
+
+Usage:
+    sudo-request [OPTIONS] COMMAND [ARGS...]
+
+Standard library only. The daemon entrypoint below is internal (spawned
+automatically); all daemon settings live in the JSON config file.
+"""
+
+from __future__ import annotations
+
+import atexit
+import json
+import os
+import queue
+import select
+import shutil
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import termios
+import threading
+import time
+import tty
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from typing import NoReturn
+
+VERSION = "0.3.0"
+PROTOCOL_HELLO = b"sudo-request/1"
+
+# Largest accepted frame payload. Chunks on the wire are 64 KiB, so this
+# is generous while still bounding memory use against a rogue peer.
+MAX_FRAME = 16 << 20
+
+# ---------------------------------------------------------------------------
+# Frame types (client <-> daemon)
+# ---------------------------------------------------------------------------
+
+HELLO = 1        # client -> daemon: protocol hello
+REQUEST = 2      # client -> daemon: encoded request
+STDIN_DATA = 4   # client -> daemon: stdin chunk
+STDIN_EOF = 5    # client -> daemon: stdin closed
+STDOUT_DATA = 6  # daemon -> client: stdout chunk
+STDERR_DATA = 7  # daemon -> client: stderr chunk
+SIGNAL = 10      # client -> daemon: forward signal (4-byte signo)
+KILL = 11        # client -> daemon: hard terminate child
+EXIT = 12        # daemon -> client: exit code as ascii digits
+ERROR = 13       # either way: fatal error message
+BYE = 14         # either way: clean disconnect
+
+# Environment handling: pass everything through EXCEPT known hijack vectors.
+#
+# The user approves the command itself, so the remaining risk is a
+# compromised calling process smuggling env (e.g. LD_PRELOAD) alongside a
+# benign-looking command, making the approved command do more than shown.
+# sudo applies its own filtering on top of this (defense in depth).
+ENV_DROP_PREFIXES = ("LD_", "DYLD_")  # dynamic linker / loader hijack
+ENV_BLACKLIST = {
+    # Shell startup hijack.
+    "IFS", "CDPATH", "ENV", "BASH_ENV", "SHELLOPTS", "BASHOPTS",
+    "ZDOTDIR",  # zsh startup directory hijack
+    # Locale / message-catalog hijack (classic escalation vector).
+    "GCONV_PATH", "LOCPATH", "NLSPATH",
+    # Interpreter library hijack for root-executed scripts.
+    "PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP",
+    "PERL5LIB", "PERL5OPT", "PERLLIB",
+    "RUBYLIB", "RUBYOPT", "NODE_OPTIONS",
+    "JAVA_TOOL_OPTIONS", "JDK_JAVA_OPTIONS",  # JVM agent injection
+}
+
+
+def env_for_child() -> list[tuple[str, str]]:
+    """Client environment minus hijack vectors (incl. shellshock-style
+    function exports whose value starts with '()')."""
+    out: list[tuple[str, str]] = []
+    for key, val in os.environ.items():
+        if key in ENV_BLACKLIST:
+            continue
+        if key.startswith(ENV_DROP_PREFIXES):
+            continue
+        if val.startswith("()"):
+            continue
+        out.append((key, val))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Paths and config
+# ---------------------------------------------------------------------------
+
+def runtime_dir() -> str:
+    """Directory for socket/lock/pid files."""
+    base = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    return base
+
+
+def socket_path() -> str:
+    return os.path.join(runtime_dir(), "sudo-request.sock")
+
+
+def startup_lock_path() -> str:
+    return os.path.join(runtime_dir(), "sudo-request.startup.lock")
+
+
+def config_path() -> str:
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, "sudo-request", "config.json")
+
+
+DEFAULT_CONFIG = {
+    "keep_sudo": True,
+    "auto_accept": False,
+    "keepalive_interval": 60,
+    "confirm_timeout": 900,
+    "terminal": None,
+    # Audit log: file path, or null to disable. Per-field switches;
+    # command output is off by default so the log can't fill up fast.
+    "audit_log": None,
+    "audit_command": True,
+    "audit_env": True,
+    "audit_stdin": True,
+    "audit_exit": True,
+    "audit_stdout": False,
+    "audit_stderr": False,
+}
+
+# Caps for variable-size audit fields, so one request can't blow up the log.
+AUDIT_STDIN_CAP = 65536
+AUDIT_OUTPUT_CAP = 1 << 20
+
+
+def _as_bool(value: object, default: bool = False) -> bool:
+    """Lenient bool for hand-edited JSON (accepts "false"/"0"/...)."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ("1", "true", "yes", "on"):
+            return True
+        if text in ("0", "false", "no", "off", ""):
+            return False
+    if isinstance(value, (int, float)):
+        return value != 0
+    return default
+
+
+def load_config() -> tuple[dict, bool]:
+    """Load the JSON config.
+
+    Missing keys are populated with defaults and saved back, so the file
+    always ends up complete. Returns (config, fresh) where fresh is True
+    when no config file existed before this call.
+    """
+    path = config_path()
+    cfg = dict(DEFAULT_CONFIG)
+    fresh = False
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            user = json.load(fh)
+        if isinstance(user, dict):
+            merged = dict(user)
+            for key, value in DEFAULT_CONFIG.items():
+                if key in merged:
+                    cfg[key] = merged[key]
+                else:
+                    merged[key] = cfg[key]
+            if any(k not in user for k in DEFAULT_CONFIG):
+                save_config(merged)
+            # Keep unknown user keys around so later saves don't drop them.
+            cfg = merged
+        else:
+            fresh = True
+            save_config(cfg)
+    except FileNotFoundError:
+        fresh = True
+        save_config(cfg)
+    except (OSError, ValueError) as exc:
+        print(f"sudo-request: ignoring invalid config {path}: {exc}",
+              file=sys.stderr)
+    return cfg, fresh
+
+
+def save_config(cfg: dict) -> None:
+    """Write the config file to disk. Best effort.
+
+    Only used for first-run setup and missing-key population; live
+    toggles intentionally never save (restart restores config values).
+    """
+    path = config_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(cfg, fh, indent=2)
+            fh.write("\n")
+    except OSError as exc:
+        print(f"sudo-request: cannot save config: {exc}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Wire protocol helpers
+# ---------------------------------------------------------------------------
+
+def send_frame(sock: socket.socket, typ: int, data: bytes = b"") -> None:
+    sock.sendall(bytes([typ]) + len(data).to_bytes(4, "big") + data)
+
+
+def recv_exact(sock: socket.socket, n: int) -> bytes:
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = sock.recv(min(n - len(buf), 65536))
+        if not chunk:
+            raise EOFError("peer closed")
+        buf += chunk
+    return bytes(buf)
+
+
+def recv_frame(sock: socket.socket) -> tuple[int, bytes]:
+    header = recv_exact(sock, 5)
+    length = int.from_bytes(header[1:5], "big")
+    if length > MAX_FRAME:
+        raise ValueError(f"frame too large: {length} bytes")
+    return header[0], recv_exact(sock, length)
+
+
+def _u32(blob: bytes, off: int) -> int:
+    return int.from_bytes(blob[off:off + 4], "big")
+
+
+def _take_blob(blob: bytes, off: int) -> tuple[bytes, int]:
+    ln = _u32(blob, off)
+    return blob[off + 4:off + 4 + ln], off + 4 + ln
+
+
+def _take_list(blob: bytes, off: int) -> tuple[list[bytes], int]:
+    n = _u32(blob, off)
+    off += 4
+    out: list[bytes] = []
+    for _ in range(n):
+        item, off = _take_blob(blob, off)
+        out.append(item)
+    return out, off
+
+
+def _enc_blob(item: bytes) -> bytes:
+    return len(item).to_bytes(4, "big") + item
+
+
+def _enc_list(items: list[bytes]) -> bytes:
+    return len(items).to_bytes(4, "big") + b"".join(_enc_blob(x) for x in items)
+
+
+def encode_request(mode: int, argv: list[str], cwd: str,
+                   env: list[tuple[str, str]]) -> bytes:
+    payload = bytes([mode])
+    payload += _enc_list([a.encode("utf-8", "surrogateescape") for a in argv])
+    payload += _enc_blob(cwd.encode("utf-8", "surrogateescape"))
+    flat: list[bytes] = []
+    for key, val in env:
+        flat.append(key.encode("utf-8", "surrogateescape"))
+        flat.append(val.encode("utf-8", "surrogateescape"))
+    payload += _enc_list(flat)
+    return payload
+
+
+def decode_request(payload: bytes) -> tuple[int, list[str], str,
+                                            list[tuple[str, str]]]:
+    mode = payload[0]
+    arg_blobs, off = _take_list(payload, 1)
+    cwd_blob, off = _take_blob(payload, off)
+    env_blobs, _off = _take_list(payload, off)
+    argv = [b.decode("utf-8", "surrogateescape") for b in arg_blobs]
+    cwd = cwd_blob.decode("utf-8", "surrogateescape")
+    env: list[tuple[str, str]] = []
+    for i in range(0, len(env_blobs), 2):
+        env.append((env_blobs[i].decode("utf-8", "surrogateescape"),
+                    env_blobs[i + 1].decode("utf-8", "surrogateescape")))
+    return mode, argv, cwd, env
+
+
+def peer_uid(sock: socket.socket) -> int | None:
+    """UID of the socket peer via SO_PEERCRED (Linux). None if unavailable."""
+    opt = getattr(socket, "SO_PEERCRED", None)
+    if opt is None:
+        return None
+    try:
+        raw = sock.getsockopt(socket.SOL_SOCKET, opt, 12)
+        _pid, uid, _gid = struct.unpack("3i", raw)
+        return uid
+    except OSError:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Terminal detection and daemon startup
+# ---------------------------------------------------------------------------
+
+# Terminals in preference order. Wayland-native first, then X11 fallbacks.
+TERMINAL_CANDIDATES = [
+    "ghostty",
+    "ptyxis",
+    "kgx",               # GNOME Console
+    "gnome-terminal",
+    "konsole",
+    "alacritty",
+    "kitty",
+    "foot",
+    "xfce4-terminal",
+    "wezterm",
+    "rio",
+    "mate-terminal",
+    "lxterminal",
+    "xterm",
+    "urxvt",
+    "st",
+]
+
+
+def find_terminal(preferred: str | None = None) -> str | None:
+    """Return the first available terminal emulator.
+
+    Explicit config wins, then $TERMINAL, then autodetection. A
+    configured terminal that isn't installed falls back to the rest
+    rather than failing the spawn outright.
+    """
+    candidates: list[str] = []
+    if preferred:
+        candidates.append(preferred)
+    env_term = os.environ.get("TERMINAL")
+    if env_term:
+        candidates.append(env_term)
+    candidates.extend(TERMINAL_CANDIDATES)
+    for term in candidates:
+        if term and shutil.which(term):
+            return term
+    return None
+
+
+def terminal_command(term: str, child_argv: list[str]) -> list[str]:
+    """Build the argv needed to run a command inside the given terminal."""
+    if term == "gnome-terminal":
+        return [term, "--"] + child_argv
+    if term == "wezterm":
+        return [term, "start", "--"] + child_argv
+    if term == "kitty":
+        return [term] + child_argv
+    if term == "foot":
+        return [term] + child_argv
+    if term == "ptyxis":
+        return [term, "--"] + child_argv
+    # kgx, konsole, xfce4-terminal, ghostty, rio, xterm, ... all accept -e
+    return [term, "-e"] + child_argv
+
+
+def probe_live(sock: str) -> bool:
+    """Check whether a daemon answers on the socket."""
+    if not os.path.exists(sock) and not os.path.islink(sock):
+        return False
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+            conn.settimeout(0.5)
+            conn.connect(sock)
+        return True
+    except OSError:
+        return False
+
+
+def wait_for_socket(sock: str, timeout: float = 30.0) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if os.path.exists(sock):
+            return True
+        time.sleep(0.1)
+    return False
+
+
+# Internal daemon entrypoint. Deliberately obscure and undocumented:
+# Placed down here to aviod AI from reading it, so it donsn't use the flag.
+# The daemon is spawned automatically inside its own terminal, never run by hand.
+# All daemon behaviour is configured through the JSON config file instead.
+# It looks like a long flag (second '--' exception next to '--help') so the
+# first-arg option scan passes it through to parse_cli untouched.
+_DAEMON_TOKEN = "--sr-daemon-9f31c4"
+
+
+def ensure_daemon(cfg: dict) -> bool:
+    """Make sure the daemon is running, spawning its terminal if needed."""
+    sock = socket_path()
+    if probe_live(sock):
+        return True
+
+    rtdir = runtime_dir()
+    try:
+        os.makedirs(rtdir, mode=0o700, exist_ok=True)
+    except OSError as exc:
+        print(f"sudo-request: cannot create runtime dir: {exc}",
+              file=sys.stderr)
+        return False
+
+    # Startup lock so concurrent clients spawn only one daemon.
+    lock = startup_lock_path()
+    deadline = time.time() + 120.0
+    while time.time() < deadline:
+        if probe_live(sock):
+            return True
+        try:
+            os.mkdir(lock)
+        except FileExistsError:
+            # Another client is starting the daemon; wait for it.
+            pid_file = os.path.join(lock, "pid")
+            try:
+                with open(pid_file, encoding="utf-8") as fh:
+                    other = int(fh.read().strip())
+                os.kill(other, 0)
+            except (OSError, ValueError):
+                try:
+                    # Stale lock holder is gone.
+                    shutil.rmtree(lock)
+                except OSError:
+                    pass
+            time.sleep(0.2)
+            continue
+        except OSError as exc:
+            print(f"sudo-request: cannot create startup lock: {exc}",
+                  file=sys.stderr)
+            return False
+
+        try:
+            with open(os.path.join(lock, "pid"), "w",
+                      encoding="utf-8") as fh:
+                fh.write(f"{os.getpid()}\n")
+            if probe_live(sock):
+                return True
+            try:
+                if os.path.exists(sock) or os.path.islink(sock):
+                    print("sudo-request: removing stale daemon socket",
+                          file=sys.stderr)
+                    os.unlink(sock)
+            except OSError:
+                pass
+            term = find_terminal(cfg.get("terminal"))
+            if term is None:
+                print("sudo-request: no terminal emulator found.",
+                      file=sys.stderr)
+                print(f"sudo-request: install one, set $TERMINAL, or set "
+                      f"\"terminal\" in {config_path()} to use sudo-request",
+                      file=sys.stderr)
+                return False
+            child = [sys.executable, os.path.abspath(__file__), _DAEMON_TOKEN]
+            cmd = terminal_command(term, child)
+            try:
+                subprocess.Popen(cmd, start_new_session=True,
+                                 stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
+            except OSError as exc:
+                print(f"sudo-request: cannot start terminal: {exc}",
+                      file=sys.stderr)
+                return False
+            if not wait_for_socket(sock):
+                print("sudo-request: daemon did not become ready",
+                      file=sys.stderr)
+                return False
+            return probe_live(sock)
+        finally:
+            shutil.rmtree(lock, ignore_errors=True)
+    print("sudo-request: timed out waiting for the daemon", file=sys.stderr)
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Daemon console: prompts plus live a/k toggles
+# ---------------------------------------------------------------------------
+
+class Console:
+    """Serialises daemon-terminal interaction.
+
+    A single background thread owns stdin. On a TTY the terminal runs in
+    cbreak mode so every keypress arrives instantly without Enter (line
+    mode is kept as fallback for pipes). When a worker is waiting for an
+    answer, input is routed to it; otherwise single-key commands toggle
+    settings immediately. Typing 'a', 'k' or 's' *during* a confirmation
+    prompt toggles/shows settings and re-asks instead of answering.
+    """
+
+    def __init__(self, daemon: "Daemon") -> None:
+        self.daemon = daemon
+        self._responses: queue.Queue[str] = queue.Queue()
+        self._awaiting = threading.Event()
+        self._write_lock = threading.Lock()
+        # Held for a whole authenticate->confirm sequence so concurrent
+        # requests can't steal each other's answers or interleave password
+        # prompts on the terminal.
+        self.prompt_lock = threading.Lock()
+        # Set while sudo may be reading a password from the terminal: the
+        # input loop must not touch stdin then, or it would steal sudo's
+        # keystrokes (stdin and /dev/tty share the terminal input queue).
+        self._input_paused = threading.Event()
+        # True once the terminal runs in cbreak mode (instant keypresses).
+        self._instant = False
+        self._stop = threading.Event()
+        self._thread = None
+
+    @contextmanager
+    def input_suspended(self):
+        """Pause stdin grabbing while sudo may read a password.
+
+        Use around every interactive `sudo -v`: while suspended the
+        input loop sleeps instead of reading, so password keystrokes
+        reach sudo instead of being eaten as daemon commands.
+        """
+        self._input_paused.set()
+        try:
+            yield
+        finally:
+            self._input_paused.clear()
+
+    # -- output ------------------------------------------------------
+    def say(self, text: str) -> None:
+        with self._write_lock:
+            print(text, flush=True)
+
+    def audit(self, rid: str, message: str) -> None:
+        if message.startswith("REQUEST "):
+            self.say(f"[{rid}] REQUEST")
+            self.say(f"    {message[len('REQUEST '):]}")
+        else:
+            self.say(f"[{rid}] {message}")
+
+    # -- input thread ------------------------------------------------
+    def start(self) -> None:
+        self._instant = self._setup_instant_keys()
+        self._stop.clear()
+        thread = threading.Thread(target=self._input_loop,
+                                  name="console-input", daemon=True)
+        self._thread = thread
+        thread.start()
+
+    def stop(self, timeout: float = 2.0) -> None:
+        """Stop the input thread (lets consoles run back to back without
+        an old thread stealing the new stdin)."""
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=timeout)
+            self._thread = None
+
+    def _setup_instant_keys(self) -> bool:
+        """Switch the daemon terminal to cbreak mode (no echo) so every
+        keypress arrives instantly, without Enter.
+
+        Without this, line buffering merges keystrokes typed at different
+        moments (e.g. a toggle 'a' plus an answer 'y') into one line that
+        then fails the y/n check. Returns False to stay in line mode when
+        stdin is not a TTY (pipes, tests). Original settings are restored
+        at process exit.
+        """
+        # NOTE: termios.error is NOT an OSError subclass (plain Exception),
+        # so it must be listed explicitly.
+        try:
+            fd = sys.stdin.fileno()
+            orig = termios.tcgetattr(fd)
+        except (OSError, ValueError, AttributeError, termios.error):
+            return False
+        try:
+            tty.setcbreak(fd)
+        except (OSError, ValueError, termios.error):
+            return False
+        atexit.register(self._restore_termios, fd, orig)
+        return True
+
+    @staticmethod
+    def _restore_termios(fd: int, attrs) -> None:
+        try:
+            termios.tcsetattr(fd, termios.TCSADRAIN, attrs)
+        except (OSError, ValueError, termios.error):
+            pass
+
+    def _input_loop(self) -> None:
+        if self._instant:
+            self.say("Press single keys (no Enter needed): 'a' toggle "
+                     "auto-accept, 'k' toggle keep-sudo, 's' show settings, "
+                     "'h' for help.")
+        else:
+            self.say("Type 'a' + Enter to toggle auto-accept, "
+                     "'k' + Enter to toggle keep-sudo, 's' + Enter for "
+                     "settings, 'h' + Enter for help.")
+        while not self._stop.is_set():
+            if self._input_paused.is_set():
+                # sudo may be reading a password; don't touch stdin.
+                time.sleep(0.1)
+                continue
+            try:
+                if self._instant:
+                    self._pump_key()
+                else:
+                    self._pump_line()
+            except (OSError, ValueError):
+                time.sleep(0.5)
+
+    def _pump_line(self) -> None:
+        """Line-mode fallback for non-TTY stdin (pipes, tests)."""
+        try:
+            readable, _, _ = select.select([sys.stdin], [], [], 0.2)
+        except (OSError, ValueError):
+            readable = [sys.stdin]  # no fileno; read directly
+        if not readable:
+            return
+        line = sys.stdin.readline()
+        if line == "":
+            # EOF on stdin (terminal closed input); avoid busy loop.
+            time.sleep(1.0)
+            return
+        text = line.strip()
+        if self._awaiting.is_set():
+            self._responses.put(text)
+        else:
+            self._handle_command(text)
+
+    def _pump_key(self) -> None:
+        """Route one instant keypress: answers go to the active prompt
+        (echoed), toggles fire at once, Enter submits an empty answer.
+
+        Reads the raw fd with os.read on purpose: sys.stdin.read(1) would
+        let TextIOWrapper buffer ahead, so select() could report an empty
+        fd while keystrokes sit in userspace - breaking both readiness
+        checks and escape-sequence swallowing.
+        """
+        try:
+            fd = sys.stdin.fileno()
+        except (OSError, ValueError, AttributeError):
+            return
+        try:
+            readable, _, _ = select.select([fd], [], [], 0.2)
+        except (OSError, ValueError):
+            return
+        if not readable:
+            return
+        try:
+            data = os.read(fd, 1)
+        except (OSError, ValueError):
+            return
+        if not data:
+            return
+        ch = data.decode("latin-1")  # 1:1, never fails; console keys are ASCII
+        if ch == "\x1b":
+            # Swallow the rest of an escape sequence (arrows, F-keys) so
+            # one keypress can't spam the prompt with several answers.
+            try:
+                while select.select([fd], [], [], 0.05)[0]:
+                    os.read(fd, 1)
+            except (OSError, ValueError):
+                pass
+            return
+        if ch in ("\r", "\n", "\x04"):
+            if self._awaiting.is_set():
+                self._responses.put("")
+                with self._write_lock:
+                    print(flush=True)
+            return
+        if self._awaiting.is_set():
+            self._responses.put(ch)
+            with self._write_lock:
+                print(ch, flush=True)
+        else:
+            self._handle_key(ch)
+
+    def _handle_key(self, ch: str) -> None:
+        """Single-keypress commands for cbreak mode (no Enter involved,
+        so whole words like 'auto' can never arrive here)."""
+        cmd = ch.lower()
+        if cmd == "a":
+            self.daemon.toggle_auto_accept()
+        elif cmd == "k":
+            self.daemon.toggle_keep_sudo()
+        elif cmd == "s":
+            self.daemon.show_settings()
+        elif cmd in ("h", "?"):
+            self.say("keys (no Enter): a = toggle auto-accept | "
+                     "k = toggle keep-sudo | s = show settings | h = help")
+        elif ch < " " or ch == "\x7f":
+            pass  # stray control key; ignore quietly
+        else:
+            self.say(f"unknown key {ch!r} (press 'h' for help)")
+
+    def _handle_command(self, text: str) -> None:
+        cmd = text.lower()
+        if cmd in ("a", "auto"):
+            self.daemon.toggle_auto_accept()
+        elif cmd in ("k", "keep"):
+            self.daemon.toggle_keep_sudo()
+        elif cmd in ("s", "status"):
+            self.daemon.show_settings()
+        elif cmd in ("h", "help", "?"):
+            self.say("commands: a = toggle auto-accept | "
+                     "k = toggle keep-sudo | s = show settings | h = help")
+        elif cmd != "":
+            self.say(f"unknown command {text!r} "
+                     "(try 'a', 'k' or 'h')")
+
+    # -- prompts -----------------------------------------------------
+    def _ask(self, prompt: str, timeout: float) -> str:
+        """Ask one question; 'a'/'k' toggle and 's' shows settings,
+        each re-asking instead of answering."""
+        while True:
+            # Drop answers meant for an older, already finished prompt so
+            # a late keystroke can't decide a later question (or linger
+            # past a timeout and be mistaken for a fresh answer).
+            try:
+                while True:
+                    self._responses.get_nowait()
+            except queue.Empty:
+                pass
+            with self._write_lock:
+                print(prompt, end="", flush=True)
+            self._awaiting.set()
+            try:
+                answer = self._responses.get(timeout=timeout)
+            except queue.Empty:
+                return ""
+            finally:
+                self._awaiting.clear()
+            lowered = answer.strip().lower()
+            if lowered in ("a", "auto"):
+                self.daemon.toggle_auto_accept()
+                continue
+            if lowered in ("k", "keep"):
+                self.daemon.toggle_keep_sudo()
+                continue
+            if lowered in ("s", "status"):
+                self.daemon.show_settings()
+                continue
+            return answer
+
+    def authenticate(self, rid: str) -> bool:
+        """Ensure sudo would succeed. Prompts for password if needed."""
+        if self.daemon.sudo_valid_nocheck():
+            return True
+        self.say(f"[{rid}] [sudo] authenticating "
+                 "(password prompt below if needed)...")
+        try:
+            with self.input_suspended():
+                result = subprocess.run(["sudo", "-v"])
+        except OSError as exc:
+            self.say(f"[{rid}] sudo not available: {exc}")
+            return False
+        return result.returncode == 0
+
+    def confirm(self, rid: str, display: str, timeout: float) -> bool:
+        answer = self._ask(
+            f"[{rid}] Allow? [y/N] "
+            f"(a=auto-accept:{on_off(self.daemon.auto_accept)} "
+            f"k=keep-sudo:{on_off(self.daemon.keep_sudo)}) ",
+            timeout,
+        )
+        return answer.strip().lower().startswith("y")
+
+
+def on_off(flag: bool) -> str:
+    return "on" if flag else "off"
+
+
+# ---------------------------------------------------------------------------
+# Daemon
+# ---------------------------------------------------------------------------
+
+class Daemon:
+    """Unix-socket server that runs approved commands via sudo."""
+
+    def __init__(self, cfg: dict, first_run: bool = False) -> None:
+        self.cfg = cfg
+        self._first_run = first_run
+        self.keep_sudo = _as_bool(cfg.get("keep_sudo", True))
+        self.auto_accept = _as_bool(cfg.get("auto_accept", False))
+        try:
+            self.keepalive_interval = int(cfg.get("keepalive_interval", 60) or 60)
+        except (TypeError, ValueError):
+            self.keepalive_interval = 60
+        if self.keepalive_interval <= 0:
+            self.keepalive_interval = 60
+        try:
+            self.confirm_timeout = float(cfg.get("confirm_timeout", 900) or 900)
+        except (TypeError, ValueError):
+            self.confirm_timeout = 900.0
+        if self.confirm_timeout <= 0:
+            self.confirm_timeout = 900.0
+        self.sock_path = socket_path()
+        self.console = Console(self)
+        self._settings_lock = threading.Lock()
+        self._id_lock = threading.Lock()
+        self._next_id = 1
+        self._children: set[int] = set()
+        self._children_lock = threading.Lock()
+        self._keepalive_stop = threading.Event()
+        self._keepalive_thread: threading.Thread | None = None
+        self._shutdown = threading.Event()
+        self._audit_warned = False
+
+    # -- settings ----------------------------------------------------
+    def _announce_settings(self) -> None:
+        self.console.say(
+            f"[settings] keep-sudo={on_off(self.keep_sudo)} "
+            f"auto-accept={on_off(self.auto_accept)}")
+
+    def show_settings(self) -> None:
+        """Print current settings (the 's' key)."""
+        self._announce_settings()
+
+    def toggle_auto_accept(self) -> None:
+        # Runtime only, deliberately never saved: a restart restores the
+        # config values. Permanent changes require editing the JSON (or
+        # deleting it for a fresh first-run setup).
+        with self._settings_lock:
+            self.auto_accept = not self.auto_accept
+        self.console.say(f"[settings] auto-accept={on_off(self.auto_accept)}")
+
+    def toggle_keep_sudo(self) -> None:
+        with self._settings_lock:
+            want = not self.keep_sudo
+        self.set_keep_sudo(want)
+
+    def set_keep_sudo(self, want: bool) -> None:
+        # Runtime only, deliberately never saved: a restart restores the
+        # config values. Permanent changes require editing the JSON (or
+        # deleting it for a fresh first-run setup).
+        with self._settings_lock:
+            if want == self.keep_sudo:
+                self.console.say(
+                    f"[settings] keep-sudo={on_off(self.keep_sudo)}")
+                return
+            if want:
+                self.console.say("[sudo] authenticating...")
+                try:
+                    with self.console.input_suspended():
+                        result = subprocess.run(["sudo", "-v"])
+                except OSError as exc:
+                    self.console.say(f"sudo not available: {exc}")
+                    return
+                if result.returncode != 0:
+                    self.console.say("[settings] keep-sudo failed: "
+                                     "authentication failed")
+                    return
+                self.keep_sudo = True
+                self._start_keepalive_locked()
+            else:
+                self.keep_sudo = False
+                self._stop_keepalive_locked()
+        self.console.say(f"[settings] keep-sudo={on_off(self.keep_sudo)}")
+
+    # -- keepalive ---------------------------------------------------
+    def _start_keepalive_locked(self) -> None:
+        if self._keepalive_thread and self._keepalive_thread.is_alive():
+            return
+        self._keepalive_stop.clear()
+        self._keepalive_thread = threading.Thread(
+            target=self._keepalive_loop, name="keepalive", daemon=True)
+        self._keepalive_thread.start()
+
+    def _stop_keepalive_locked(self) -> None:
+        self._keepalive_stop.set()
+
+    def _keepalive_loop(self) -> None:
+        while not self._keepalive_stop.wait(self.keepalive_interval):
+            if not self.sudo_valid_nocheck():
+                self.console.say("[keepalive] timestamp expired; "
+                                 "re-authenticating")
+                try:
+                    with self.console.input_suspended():
+                        result = subprocess.run(["sudo", "-v"])
+                except OSError as exc:
+                    self.console.say(f"[keepalive] sudo error: {exc}")
+                    continue
+                if result.returncode == 0:
+                    self.console.say("[keepalive] ok")
+                else:
+                    self.console.say("[keepalive] authentication failed")
+
+    @staticmethod
+    def sudo_valid_nocheck() -> bool:
+        """True if the cached sudo timestamp is still valid."""
+        try:
+            result = subprocess.run(["sudo", "-n", "-v"],
+                                    stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL)
+        except OSError:
+            return False
+        return result.returncode == 0
+
+    def first_run_setup(self) -> None:
+        """Ask for initial settings when no config existed yet.
+
+        Runs before the console input thread starts, so stdin can be read
+        directly here. Afterwards everything is toggleable with 'a'/'k'.
+        """
+        self.console.say("First run: choose daemon defaults "
+                         "(saved to the config file, "
+                         "change anytime with 'a'/'k').")
+        self.console.say("    K = keep sudo unlocked (default)  "
+                         "k = don't keep sudo unlocked")
+        self.console.say("    Y = auto-accept (no prompts)      "
+                         "y = require confirmation (default)")
+        try:
+            answer = input("> ")
+        except EOFError:
+            answer = ""
+        # First character only: substring matching would turn e.g. "OK"
+        # into keep-sudo-on by accident.
+        key = answer.strip()[:1]
+        if key == "K":
+            self.keep_sudo = True
+        elif key == "k":
+            self.keep_sudo = False
+        if key == "Y":
+            self.auto_accept = True
+        elif key == "y":
+            self.auto_accept = False
+        self.cfg["keep_sudo"] = self.keep_sudo
+        self.cfg["auto_accept"] = self.auto_accept
+        save_config(self.cfg)
+        self.console.say("")
+
+    # -- server ------------------------------------------------------
+    def serve(self) -> int:
+        if probe_live(self.sock_path):
+            print("sudo-request: daemon is already running", file=sys.stderr)
+            return 2
+        if shutil.which("sudo") is None:
+            print("sudo-request: sudo not found", file=sys.stderr)
+            return 1
+        try:
+            os.makedirs(runtime_dir(), mode=0o700, exist_ok=True)
+        except OSError as exc:
+            print(f"sudo-request: cannot create runtime dir: {exc}",
+                  file=sys.stderr)
+            return 1
+
+        # Bind before any interactive prompting: clients waiting on the
+        # socket must not time out while the user answers setup questions
+        # or a password prompt. Workers simply queue on the prompt lock
+        # until the daemon is ready for them.
+        if os.path.exists(self.sock_path) or os.path.islink(self.sock_path):
+            if probe_live(self.sock_path):
+                print("sudo-request: daemon is already running",
+                      file=sys.stderr)
+                return 2
+            try:
+                os.unlink(self.sock_path)
+            except OSError:
+                pass
+
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            server.bind(self.sock_path)
+        except OSError as exc:
+            print(f"sudo-request: cannot bind {self.sock_path}: {exc}",
+                  file=sys.stderr)
+            return 1
+        os.chmod(self.sock_path, 0o600)
+        server.listen(32)
+        server.settimeout(1.0)
+
+        self.console.say("sudo-request daemon")
+        self.console.say(f"[config] {config_path()}")
+        self.console.say("")
+
+        try:
+            if self._first_run:
+                self.first_run_setup()
+
+            if self.keep_sudo:
+                self.console.say("[sudo] authenticating...")
+                try:
+                    with self.console.input_suspended():
+                        result = subprocess.run(["sudo", "-v"])
+                except OSError as exc:
+                    print(f"sudo-request: sudo not available: {exc}",
+                          file=sys.stderr)
+                    server.close()
+                    self._cleanup()
+                    return 1
+                if result.returncode != 0:
+                    print("sudo-request: initial sudo authentication failed",
+                          file=sys.stderr)
+                    server.close()
+                    self._cleanup()
+                    return 1
+                with self._settings_lock:
+                    self._start_keepalive_locked()
+
+            self._announce_settings()
+            self.console.say("Daemon ready.")
+            self.console.start()
+        except Exception:
+            # Never leave a bound-but-dead socket behind on startup failure.
+            server.close()
+            self._cleanup()
+            raise
+
+        def handle_sig(_signo: int, _frame: object) -> None:
+            self._shutdown.set()
+
+        signal.signal(signal.SIGINT, handle_sig)
+        signal.signal(signal.SIGTERM, handle_sig)
+
+        self.console.say(f"listening on {self.sock_path}")
+        try:
+            while not self._shutdown.is_set():
+                try:
+                    conn, _addr = server.accept()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    if self._shutdown.is_set():
+                        break
+                    continue
+                thread = threading.Thread(
+                    target=self.handle_connection,
+                    args=(conn,), name="worker", daemon=True)
+                thread.start()
+        finally:
+            server.close()
+            self._cleanup()
+        self.console.say("sudo-request: daemon stopped.")
+        return 0
+
+    def _cleanup(self) -> None:
+        with self._settings_lock:
+            self._stop_keepalive_locked()
+        with self._children_lock:
+            pids = list(self._children)
+        for pid in pids:
+            try:
+                os.killpg(pid, signal.SIGTERM)
+            except OSError:
+                pass
+        time.sleep(0.3)
+        for pid in pids:
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except OSError:
+                pass
+        try:
+            if os.path.exists(self.sock_path):
+                os.unlink(self.sock_path)
+        except OSError:
+            pass
+
+    def audit_event(self, entry: dict) -> None:
+        """Append one JSON-lines audit entry if audit_log is configured."""
+        path = self.cfg.get("audit_log")
+        if not path:
+            return
+        try:
+            line = json.dumps(entry)
+        except (TypeError, ValueError) as exc:
+            line = json.dumps({"ts": entry.get("ts"), "id": entry.get("id"),
+                               "error": f"unserializable entry: {exc}"})
+        try:
+            parent = os.path.dirname(path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+        except OSError as exc:
+            if not self._audit_warned:
+                self._audit_warned = True
+                self.console.say(f"[audit] cannot write {path}: {exc}")
+
+    # -- per-request worker ------------------------------------------
+    def handle_connection(self, conn: socket.socket) -> None:
+        try:
+            uid = peer_uid(conn)
+            if uid is not None and uid != os.getuid():
+                try:
+                    send_frame(conn, ERROR, b"untrusted peer")
+                except OSError:
+                    pass
+                return
+
+            hello_ok = False
+            request = None
+            try:
+                while request is None:
+                    typ, data = recv_frame(conn)
+                    if typ == HELLO:
+                        hello_ok = (data == PROTOCOL_HELLO)
+                    elif typ == REQUEST and hello_ok:
+                        request = decode_request(data)
+                    elif typ == BYE:
+                        return
+            except (EOFError, OSError):
+                return
+
+            if request is None:
+                try:
+                    send_frame(conn, ERROR, b"invalid handshake")
+                except OSError:
+                    pass
+                return
+
+            # Handshake complete: claim an audit ID. Liveness probes that
+            # connect without a handshake never reach this point, so they
+            # no longer consume IDs.
+            with self._id_lock:
+                rid = self._next_id
+                self._next_id = self._next_id + 1 if self._next_id < 9999 else 1
+            rid_str = f"{rid:04d}"
+            threading.current_thread().name = f"worker-{rid_str}"
+
+            mode, argv, cwd, env_list = request
+            display = " ".join(repr(a) for a in argv)
+            if len(display) > 2000:
+                display = display[:2000] + " ..."
+
+            entry: dict = {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "id": rid_str,
+                "uid": uid if uid is not None else os.getuid(),
+                "mode": "sudo" if mode == 0 else "delegated",
+                "cwd": cwd,
+            }
+            if _as_bool(self.cfg.get("audit_command", True)):
+                entry["command"] = argv
+            if _as_bool(self.cfg.get("audit_env", True)):
+                entry["env"] = dict(env_list)
+
+            # One prompt sequence at a time across all workers.
+            with self.console.prompt_lock:
+                if not self.console.authenticate(rid_str):
+                    self.console.audit(rid_str, "AUTH FAILED")
+                    entry["decision"] = "auth-failed"
+                    self.audit_event(entry)
+                    try:
+                        send_frame(conn, ERROR, b"sudo authentication failed")
+                    except OSError:
+                        pass
+                    return
+
+                self.console.audit(rid_str, "REQUEST " + display)
+                if self.auto_accept:
+                    decision = "auto-accepted"
+                    self.console.audit(rid_str, "AUTO-ACCEPTED")
+                elif self.console.confirm(rid_str, display,
+                                          self.confirm_timeout):
+                    decision = "accepted"
+                    self.console.audit(rid_str, "ACCEPTED")
+                else:
+                    self.console.audit(rid_str, "DENIED")
+                    entry["decision"] = "denied"
+                    self.audit_event(entry)
+                    try:
+                        send_frame(conn, ERROR, b"request denied by user")
+                    except OSError:
+                        pass
+                    return
+            entry["decision"] = decision
+
+            # Per-request cwd without touching the daemon's own directory:
+            # os.chdir in a thread would race every other worker.
+            popen_cwd = cwd if (cwd and os.path.isdir(cwd)) else None
+
+            child_env = dict(os.environ)
+            for key, val in env_list:
+                child_env[key] = val
+
+            if mode == 0:
+                cmd = ["sudo", "-E", "--"] + argv
+            else:
+                cmd = argv
+
+            capture = {
+                "stdin": _as_bool(self.cfg.get("audit_stdin", True)),
+                "stdout": _as_bool(self.cfg.get("audit_stdout", False)),
+                "stderr": _as_bool(self.cfg.get("audit_stderr", False)),
+            }
+
+            try:
+                proc = subprocess.Popen(
+                    cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    # New process GROUP (killable via killpg) but same
+                    # SESSION: the child keeps the daemon's controlling
+                    # terminal, so sudo sees the same per-TTY timestamp
+                    # ticket (tty_tickets). start_new_session would detach
+                    # the terminal and sudo would re-demand a password.
+                    preexec_fn=lambda: os.setpgid(0, 0),
+                    env=child_env, cwd=popen_cwd)
+            except OSError as exc:
+                entry["error"] = f"cannot start command: {exc}"
+                self.audit_event(entry)
+                try:
+                    send_frame(conn, ERROR,
+                               f"cannot start command: {exc}".encode())
+                except OSError:
+                    pass
+                return
+
+            with self._children_lock:
+                self._children.add(proc.pid)
+            try:
+                code, captured = self._relay(conn, proc, capture)
+            finally:
+                with self._children_lock:
+                    self._children.discard(proc.pid)
+
+            if capture["stdin"]:
+                entry["stdin"] = captured["stdin"]
+                if captured["stdin_truncated"]:
+                    entry["stdin_truncated"] = True
+            if capture["stdout"]:
+                entry["stdout"] = captured["stdout"]
+                if captured["stdout_truncated"]:
+                    entry["stdout_truncated"] = True
+            if capture["stderr"]:
+                entry["stderr"] = captured["stderr"]
+                if captured["stderr_truncated"]:
+                    entry["stderr_truncated"] = True
+            if _as_bool(self.cfg.get("audit_exit", True)):
+                entry["exit"] = code
+            self.audit_event(entry)
+
+            try:
+                send_frame(conn, EXIT, str(code).encode())
+                send_frame(conn, BYE)
+            except OSError:
+                pass
+            self.console.audit(rid_str, f"EXIT {code}")
+        except Exception as exc:  # never kill the daemon on worker errors
+            try:
+                send_frame(conn, ERROR,
+                           f"daemon error: {exc}".encode()[:400])
+            except OSError:
+                pass
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    def _relay(self, conn: socket.socket,
+               proc: subprocess.Popen[bytes],
+               capture: dict) -> tuple[int, dict]:
+        """Forward stdin/signals to the child, stdout/stderr back.
+
+        capture selects which streams are also recorded for the audit log
+        (keys 'stdin'/'stdout'/'stderr'). Returns (exit code, captured
+        text with '<name>_truncated' flags).
+        """
+        assert proc.stdin and proc.stdout and proc.stderr
+        child_stdin = proc.stdin
+        out_fd = proc.stdout.fileno()
+        err_fd = proc.stderr.fileno()
+        conn_fd = conn.fileno()
+        conn.setblocking(False)
+
+        pending = b""          # client bytes waiting for the child stdin
+        inbuf = bytearray()    # raw client bytes awaiting frame parsing
+        stdin_eof = False
+        out_eof = False
+        err_eof = False
+        code = 1
+        captured = {
+            "stdin": bytearray(), "stdin_truncated": False,
+            "stdout": bytearray(), "stdout_truncated": False,
+            "stderr": bytearray(), "stderr_truncated": False,
+        }
+
+        def _remember(stream: str, data: bytes, cap: int) -> None:
+            buf = captured[stream]
+            room = cap - len(buf)
+            if room > 0:
+                buf.extend(data[:room])
+            if len(data) > room:
+                captured[stream + "_truncated"] = True
+
+        def finish() -> tuple[int, dict]:
+            def text(stream: str) -> str:
+                return bytes(captured[stream]).decode("utf-8", "replace")
+            return code, {
+                "stdin": text("stdin"),
+                "stdin_truncated": captured["stdin_truncated"],
+                "stdout": text("stdout"),
+                "stdout_truncated": captured["stdout_truncated"],
+                "stderr": text("stderr"),
+                "stderr_truncated": captured["stderr_truncated"],
+            }
+
+        def kill_group(sig: int) -> None:
+            try:
+                os.killpg(proc.pid, sig)
+            except OSError:
+                pass
+
+        def hard_terminate() -> None:
+            kill_group(signal.SIGTERM)
+            try:
+                proc.wait(timeout=2)
+            except Exception:
+                kill_group(signal.SIGKILL)
+                try:
+                    proc.wait()
+                except Exception:
+                    pass
+
+        def send_chunk(typ: int, chunk: bytes) -> bool:
+            """Send on the nonblocking socket, waiting briefly if its
+            buffer is full. False means the client is gone."""
+            for _ in range(4):
+                try:
+                    send_frame(conn, typ, chunk)
+                    return True
+                except BlockingIOError:
+                    _, writable, _ = select.select([], [conn_fd], [], 5.0)
+                    if not writable:
+                        return False
+                except OSError:
+                    return False
+            return False
+
+        def pump_client() -> bool:
+            """Drain the socket and handle complete frames.
+
+            Returns False when the client went away or asked to stop.
+            """
+            nonlocal pending, stdin_eof
+            try:
+                while True:
+                    try:
+                        chunk = conn.recv(65536)
+                    except BlockingIOError:
+                        break
+                    if not chunk:
+                        return False
+                    inbuf.extend(chunk)
+            except OSError:
+                return False
+            while len(inbuf) >= 5:
+                length = int.from_bytes(inbuf[1:5], "big")
+                if length > MAX_FRAME:
+                    raise ValueError(f"frame too large: {length} bytes")
+                if len(inbuf) < 5 + length:
+                    break  # partial frame; wait for more bytes
+                typ = inbuf[0]
+                data = bytes(inbuf[5:5 + length])
+                del inbuf[:5 + length]
+                if typ == STDIN_DATA:
+                    pending += data
+                    if capture["stdin"] and data:
+                        _remember("stdin", data, AUDIT_STDIN_CAP)
+                elif typ == STDIN_EOF:
+                    stdin_eof = True
+                elif typ == SIGNAL and len(data) == 4:
+                    kill_group(int.from_bytes(data, "big"))
+                elif typ in (KILL, BYE, ERROR):
+                    return False
+            return True
+
+        while True:
+            readers = []
+            if not out_eof:
+                readers.append(out_fd)
+            if not err_eof:
+                readers.append(err_fd)
+            if len(pending) < (1 << 22):
+                readers.append(conn_fd)
+            writers = [child_stdin.fileno()] if pending and child_stdin else []
+            try:
+                ready_r, ready_w, _ = select.select(readers, writers, [], 0.5)
+            except (OSError, ValueError):
+                hard_terminate()
+                break
+
+            if conn_fd in ready_r:
+                try:
+                    alive = pump_client()
+                except ValueError:
+                    hard_terminate()
+                    return finish()
+                if not alive:
+                    hard_terminate()
+                    return finish()
+
+            for fd in ready_r:
+                if fd == out_fd:
+                    try:
+                        chunk = os.read(out_fd, 65536)
+                    except OSError:
+                        chunk = b""
+                    if chunk:
+                        if capture["stdout"]:
+                            _remember("stdout", chunk, AUDIT_OUTPUT_CAP)
+                        if not send_chunk(STDOUT_DATA, chunk):
+                            hard_terminate()
+                            return finish()
+                    else:
+                        out_eof = True
+                elif fd == err_fd:
+                    try:
+                        chunk = os.read(err_fd, 65536)
+                    except OSError:
+                        chunk = b""
+                    if chunk:
+                        if capture["stderr"]:
+                            _remember("stderr", chunk, AUDIT_OUTPUT_CAP)
+                        if not send_chunk(STDERR_DATA, chunk):
+                            hard_terminate()
+                            return finish()
+                    else:
+                        err_eof = True
+
+            for _fd in ready_w:
+                if child_stdin:
+                    try:
+                        written = os.write(child_stdin.fileno(), pending)
+                    except OSError:
+                        try:
+                            child_stdin.close()
+                        except OSError:
+                            pass
+                        child_stdin = None
+                        pending = b""
+                        break
+                    pending = pending[written:]
+                    if not pending and stdin_eof and child_stdin:
+                        try:
+                            child_stdin.close()
+                        except OSError:
+                            pass
+                        child_stdin = None
+
+            if child_stdin is None:
+                pending = b""
+
+            if out_eof and err_eof and proc.poll() is not None:
+                ret = proc.returncode
+                code = ret if ret >= 0 else 128 + (-ret)
+                break
+
+        return finish()
+
+
+# ---------------------------------------------------------------------------
+# Client
+# ---------------------------------------------------------------------------
+
+def run_client(mode: int, argv: list[str], cfg: dict) -> int:
+    """Connect to the daemon and proxy stdio. Returns the remote exit code."""
+    try:
+        os.makedirs(runtime_dir(), mode=0o700, exist_ok=True)
+    except OSError as exc:
+        print(f"sudo-request: cannot create runtime dir: {exc}",
+              file=sys.stderr)
+        return 1
+    if not ensure_daemon(cfg):
+        return 1
+
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(0.2)
+    last_err: OSError | None = None
+    for _ in range(50):
+        try:
+            sock.connect(socket_path())
+            break
+        except OSError as exc:
+            last_err = exc
+            time.sleep(0.1)
+    else:
+        print(f"sudo-request: cannot connect to daemon: {last_err}",
+              file=sys.stderr)
+        return 1
+    sock.settimeout(None)
+
+    env_list = env_for_child()
+    try:
+        payload = encode_request(mode, argv, os.getcwd(), env_list)
+        send_frame(sock, HELLO, PROTOCOL_HELLO)
+        send_frame(sock, REQUEST, payload)
+    except OSError as exc:
+        print(f"sudo-request: cannot send request: {exc}", file=sys.stderr)
+        sock.close()
+        return 1
+
+    stop_stdin = threading.Event()
+
+    def stdin_loop() -> None:
+        try:
+            while not stop_stdin.is_set():
+                try:
+                    chunk = os.read(0, 65536)
+                except OSError:
+                    return
+                if not chunk:
+                    try:
+                        send_frame(sock, STDIN_EOF)
+                    except OSError:
+                        pass
+                    return
+                try:
+                    send_frame(sock, STDIN_DATA, chunk)
+                except OSError:
+                    return
+        except ValueError:
+            pass
+
+    stdin_thread = threading.Thread(target=stdin_loop, daemon=True)
+    # No stdin to forward when running interactively without a pipe? Always
+    # forward; EOF is handled above.
+    stdin_thread.start()
+
+    last_sig: list[int | None] = [None]
+    sig_armed = False
+
+    def on_signal(signo: int, _frame: object) -> None:
+        nonlocal sig_armed
+        last_sig[0] = signo
+        try:
+            send_frame(sock, SIGNAL, signo.to_bytes(4, "big"))
+        except OSError:
+            pass
+        # If the child ignores the signal, bound the wait so Ctrl-C
+        # still returns locally.
+        def arm_timeout() -> None:
+            time.sleep(1.0)
+            try:
+                sock.settimeout(2.0)
+            except OSError:
+                pass
+        if not sig_armed:
+            sig_armed = True
+            threading.Thread(target=arm_timeout, daemon=True).start()
+
+    old_int = signal.getsignal(signal.SIGINT)
+    old_term = signal.getsignal(signal.SIGTERM)
+    signal.signal(signal.SIGINT, on_signal)
+    signal.signal(signal.SIGTERM, on_signal)
+
+    status = 1
+    discard_stdout = False
+    try:
+        while True:
+            try:
+                typ, data = recv_frame(sock)
+            except socket.timeout:
+                sig = last_sig[0]
+                status = 130 if sig is None else 128 + sig
+                break
+            except ValueError as exc:
+                print(f"sudo-request: bad frame from daemon: {exc}",
+                      file=sys.stderr)
+                status = 1
+                break
+            except (EOFError, OSError):
+                break
+            if typ == STDOUT_DATA:
+                if not discard_stdout:
+                    try:
+                        sys.stdout.buffer.write(data)
+                        sys.stdout.buffer.flush()
+                    except (BrokenPipeError, OSError):
+                        discard_stdout = True
+            elif typ == STDERR_DATA:
+                try:
+                    sys.stderr.buffer.write(data)
+                    sys.stderr.buffer.flush()
+                except (BrokenPipeError, OSError):
+                    pass
+            elif typ == EXIT:
+                try:
+                    status = int(data.decode().strip() or "1")
+                except ValueError:
+                    status = 1
+                break
+            elif typ == ERROR:
+                print(f"sudo-request: {data.decode('utf-8', 'replace')}",
+                      file=sys.stderr)
+                status = 1
+                break
+            elif typ == BYE:
+                break
+    finally:
+        stop_stdin.set()
+        signal.signal(signal.SIGINT, old_int)
+        signal.signal(signal.SIGTERM, old_term)
+        try:
+            sock.close()
+        except OSError:
+            pass
+    return status
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+USAGE = """\
+Usage: sudo-request [OPTIONS] COMMAND [ARGUMENTS...]
+
+Request a privileged command through the persistent sudo-request daemon.
+The daemon (run in its own terminal) handles confirmation, sudo
+authentication, execution, auditing, and cancellation.
+
+Only the first argument is ever read as an option, and only when it
+starts with '-'. Everything else is the command, verbatim.
+
+OPTIONS
+  -u                 delegated mode: run COMMAND as the normal user after
+                     ensuring a valid sudo timestamp, so COMMAND may call
+                     sudo itself without prompting
+  -p                 pass everything after this point to the command
+                     verbatim (for commands starting with '-')
+  -h                 show this help and exit
+  -v                 print version and exit
+
+Example:
+  sudo-request pacman -Syu
+  echo foo | sudo-request tee /etc/example.conf
+  sudo-request -u paru -Syu
+  sudo-request -p -flag-looking-command --foo
+"""
+
+
+def _usage_error(message: str) -> "NoReturn":
+    print(f"sudo-request: {message}", file=sys.stderr)
+    print(USAGE, end="", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def parse_cli(argv: list[str]) -> tuple[str, bool, list[str]]:
+    """Split argv into (action, delegated, command).
+
+    Only argv[0] is interpreted as options, and only if it starts with
+    '-'. Short letters may combine (e.g. '-up'). A '-p' passes everything
+    after it to the command verbatim, so dash-leading commands work.
+    The undocumented daemon token is accepted only as the sole argument
+    and yields the 'daemon' action. Prints help/version/errors and
+    raises SystemExit for those cases.
+    """
+    if not argv:
+        print(USAGE, end="")
+        raise SystemExit(1)
+    first = argv[0]
+    if first == _DAEMON_TOKEN:
+        if len(argv) > 1:
+            _usage_error(f"{_DAEMON_TOKEN} takes no arguments")
+            raise AssertionError("unreachable")
+        return "daemon", False, []
+    if first == "--help":
+        # The one accepted long option; nothing else starting with '--'
+        # is consumed.
+        print(USAGE, end="")
+        raise SystemExit(0)
+    if not (first.startswith("-") and len(first) > 1):
+        return "run", False, list(argv)
+    delegated = False
+    for ch in first[1:]:
+        if ch == "u":
+            delegated = True
+        elif ch == "p":
+            pass  # rest of argv is always the command, verbatim
+        elif ch == "h":
+            print(USAGE, end="")
+            raise SystemExit(0)
+        elif ch == "v":
+            print(f"sudo-request {VERSION}")
+            raise SystemExit(0)
+        else:
+            _usage_error(f"unknown option: {first}")
+            raise AssertionError("unreachable")
+    command = argv[1:]
+    if not command:
+        print(USAGE, end="")
+        raise SystemExit(1)
+    return "run", delegated, command
+
+
+def main(argv: list[str] | None = None) -> int:
+    raw = sys.argv[1:] if argv is None else argv
+    action, delegated, command = parse_cli(raw)
+    if action == "daemon":
+        cfg, fresh = load_config()
+        return Daemon(cfg, first_run=fresh).serve()
+
+    cfg, _fresh = load_config()
+
+    mode = 1 if delegated else 0
+    return run_client(mode, command, cfg)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# fake-sudo: test double for /usr/bin/sudo used by the automated suite.
+#
+# Behaviour is driven by environment variables:
+#   FAKE_SUDO_UNLOCKED=1 (default)  -> `sudo -v` / `sudo -n -v` succeed
+#   FAKE_SUDO_UNLOCKED=0            -> `sudo -n -v` fails; `sudo -v` reads one
+#                                      line from stdin and succeeds only if it
+#                                      equals $FAKE_SUDO_PASSWORD
+#   FAKE_SUDO_PASSWORD=secret (default)
+# Anything else (`sudo -E -- cmd ...`) is executed directly.
+set -u
+
+unlocked="${FAKE_SUDO_UNLOCKED:-1}"
+
+if [ "${1:-}" = "-n" ]; then
+    # `sudo -n -v`: never prompts, reports timestamp state.
+    [ "$unlocked" = "1" ] && exit 0 || exit 1
+fi
+
+if [ "${1:-}" = "-v" ]; then
+    # `sudo -v`: succeeds immediately when unlocked, else reads a
+    # "password" line from stdin like the real password prompt.
+    if [ "$unlocked" = "1" ]; then
+        exit 0
+    fi
+    IFS= read -r pw || exit 1
+    [ "$pw" = "${FAKE_SUDO_PASSWORD:-secret}" ] && exit 0 || exit 1
+fi
+
+# `sudo -E -- cmd ...`: drop sudo's own flags, run the command.
+while [ $# -gt 0 ]; do
+    [ "$1" = "--" ] && { shift; break; }
+    shift
+done
+exec "$@"
