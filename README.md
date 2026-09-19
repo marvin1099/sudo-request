@@ -17,14 +17,6 @@ echo foo | sudo-request tee /etc/example.conf
 sudo-request -u paru -Syu
 ```
 
-- [Download & Install](#download--install)
-- [Skill install (for AI agents)](#skill-install-for-ai-agents)
-- [How it works](#how-it-works-read-this-first)
-- [Usage](#usage)
-- [Daemon window keys](#daemon-window-keys-no-enter-needed)
-- [Config](#config)
-- [Testing](#testing)
-
 Requirements: Linux, Python 3, `sudo`, and a terminal emulator.
 
 ## Download & Install
@@ -116,8 +108,8 @@ again). While `sudo` reads a password, key grabbing pauses.
 
 ## Config
 
-Lives at `~/.config/sudo-request/config.json` — created with defaults,
-missing keys filled in automatically, path shown in the daemon window.
+Lives at `~/.config/sudo-request/config.json` — defaults created on
+first run, missing keys filled in, path shown in the daemon window.
 
 | Key                | Default | Meaning                                              |
 | ------------------ | ------- | ---------------------------------------------------- |
