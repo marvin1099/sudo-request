@@ -11,8 +11,7 @@ standard library only (`sudo-request`, Python 3).
 
 Ideal with an app like OpenCode where commands get run for you: the
 agent runs `sudo-request …` instead of `sudo …`, and **you** approve
-each privileged command in the daemon window. See `SKILL.md` — drop it
-into your agent's skills so it knows how `sudo-request` behaves.
+each privileged command in the daemon window. See `SKILL.md`.
 
 ```sh
 sudo-request pacman -Syu
@@ -99,7 +98,7 @@ starts with `-`. Everything else is the command, verbatim.
 | Option | Meaning                                                        |
 | ------ | -------------------------------------------------------------- |
 | `-u`   | delegated mode: run as your user with a usable sudo timestamp  |
-| `-p`   | pass everything after this point through verbatim (for commands starting with `-`) |
+| `-p`   | pass the rest through verbatim (for commands starting with `-`) |
 | `-h`   | show help (`--help` also works, nothing else long does)        |
 | `-v`   | print version                                                  |
 
@@ -133,17 +132,13 @@ missing keys filled in automatically, path shown in the daemon window.
 | `confirm_timeout`  | `900`   | seconds before an unanswered prompt denies           |
 | `terminal`         | `null`  | preferred terminal (`$TERMINAL`, else autodetect)     |
 | `audit_log`        | `null`  | JSON-lines audit log path (`null` = off)             |
-| `audit_command`    | `true`  | log the command                                      |
-| `audit_env`        | `true`  | log the environment                                  |
-| `audit_stdin`      | `true`  | log piped stdin (capped at 64 KiB)                   |
-| `audit_exit`       | `true`  | log the exit code                                    |
-| `audit_stdout`     | `false` | log stdout (1 MiB cap; off so the log stays small)   |
-| `audit_stderr`     | `false` | log stderr (same cap)                                |
+| `audit_command/env/stdin/exit` | `true` | what gets logged (stdin capped at 64 KiB)   |
+| `audit_stdout/stderr` | `false` | log output (1 MiB cap; off to keep the log small) |
 
 Denied and failed-auth requests are logged too (no exit code).
-Toggles (`a`/`k`) apply to the running daemon only and are never
-written back — restart restores config values. For permanent changes,
-edit the JSON or delete it and the daemon asks again (first-run setup).
+Toggles (`a`/`k`) are never written back — restart restores config
+values; edit the JSON (or delete it for a fresh first-run setup) to
+change them permanently.
 
 Environment passes through **except** known hijack vectors (`LD_*` /
 `DYLD_*`, shell-init, locale-path and interpreter-library vars,
@@ -159,9 +154,11 @@ python3 -m unittest discover -s tests -v
 ```
 
 Never touches your real daemon, config, or sudo. Uses
-**`tests/fixtures/fake-sudo`** (a `sudo` double; password mode proves
-the daemon never steals sudo's keystrokes) and **fake terminals**
-(`test_console_pty.py` drives the console through a `pty` pair).
+**`tests/fixtures/fake-sudo`** (a `sudo` double, incl. a password mode
+proving the daemon never steals sudo's keystrokes) and **fake
+terminals** (`test_console_pty.py` drives the console through a `pty`
+pair). Timeouts plus per-test teardown mean failures report instead of
+hanging.
 
 | File                    | What it covers                                              |
 | ----------------------- | ----------------------------------------------------------- |
@@ -169,6 +166,3 @@ the daemon never steals sudo's keystrokes) and **fake terminals**
 | `test_config_env.py`    | config defaults/populate, env blacklist, terminal, first-run |
 | `test_console_pty.py`   | instant keys, answers, ESC swallowing, draining             |
 | `test_integration.py`   | live daemon+client: stdio, exit codes, audit log, deny paths |
-
-Timing-sensitive paths use generous timeouts and every test tears its
-daemon down, so failures report instead of hanging.
