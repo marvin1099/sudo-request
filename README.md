@@ -21,6 +21,17 @@ echo foo | sudo-request tee /etc/example.conf
 sudo-request -u paru -Syu
 ```
 
+- [Download & Install](#download--install)
+- [Skill install (for AI agents)](#skill-install-for-ai-agents)
+- [How it works](#how-it-works-read-this-first)
+- [Usage](#usage)
+- [Daemon window keys](#daemon-window-keys-no-enter-needed)
+- [Config](#config)
+- [Testing](#testing)
+
+Requirements: Linux, Python 3, `sudo`, and a terminal emulator for the
+daemon window.
+
 ## Download & Install
 
 Releases (Codeberg upstream, GitHub mirror):
@@ -28,12 +39,13 @@ Releases (Codeberg upstream, GitHub mirror):
 - <https://codeberg.org/marvin1099/sudo-request/releases>
 - <https://github.com/marvin1099/sudo-request/releases>
 
-Quickstart — pull the file straight into `~/.local/bin`:
+Quickstart — pull the file straight into `~/.local/bin` (always the
+newest release, no version in the URL to go stale):
 
 ```sh
 mkdir -p ~/.local/bin
 curl -fSL -o ~/.local/bin/sudo-request \
-  https://codeberg.org/marvin1099/sudo-request/releases/download/v0.3.0/sudo-request
+  https://github.com/marvin1099/sudo-request/releases/latest/download/sudo-request
 chmod +x ~/.local/bin/sudo-request
 ```
 
@@ -48,7 +60,7 @@ OpenCode shown as example (replace the folder with your setup's):
 
 ```sh
 curl -fSL -o ~/Downloads/SKILL.sudo-request.md \
-  https://codeberg.org/marvin1099/sudo-request/releases/download/v0.3.0/SKILL.md
+  https://github.com/marvin1099/sudo-request/releases/latest/download/SKILL.md
 mkdir -p ~/.config/opencode/skills/sudo-request
 cp ~/Downloads/SKILL.sudo-request.md \
   ~/.config/opencode/skills/sudo-request/SKILL.md
@@ -116,10 +128,11 @@ and ask again instead of answering, so a keystroke can never leak into
 an answer. While `sudo` reads a password, key grabbing pauses so your
 password reaches sudo untouched.
 
-## Config (`~/.config/sudo-request/config.json`)
+## Config
 
-Created with defaults on first run; missing keys are filled in
-automatically. Shown in the daemon window on startup.
+Lives at `~/.config/sudo-request/config.json`. Created with defaults on
+first run; missing keys are filled in automatically. Shown in the daemon
+window on startup.
 
 | Key                | Default | Meaning                                              |
 | ------------------ | ------- | ---------------------------------------------------- |
