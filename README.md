@@ -120,11 +120,35 @@ applies its own filtering on top.
 
 ## Install
 
-Copy the file somewhere on your `PATH` and make it executable:
+Releases (Codeberg upstream, GitHub mirror):
+
+- <https://codeberg.org/marvin1099/sudo-request/releases>
+- <https://github.com/marvin1099/sudo-request/releases>
+
+Quickstart — pull the file straight into `~/.local/bin`:
 
 ```sh
-cp sudo-request ~/.local/bin/
+mkdir -p ~/.local/bin
+curl -fSL -o ~/.local/bin/sudo-request \
+  https://codeberg.org/marvin1099/sudo-request/releases/download/v0.3.0/sudo-request
 chmod +x ~/.local/bin/sudo-request
+```
+
+Or from source: copy the `sudo-request` file anywhere on your `PATH`
+and make it executable.
+
+## Skill install (for AI agents)
+
+`SKILL.md` teaches an agent to use `sudo-request` instead of `sudo`.
+Agents all use different skill folders, so place the file yourself —
+OpenCode shown as example (replace the folder with your setup's):
+
+```sh
+curl -fSL -o ~/Downloads/SKILL.sudo-request.md \
+  https://codeberg.org/marvin1099/sudo-request/releases/download/v0.3.0/SKILL.md
+mkdir -p ~/.config/opencode/skills/sudo-request
+cp ~/Downloads/SKILL.sudo-request.md \
+  ~/.config/opencode/skills/sudo-request/SKILL.md
 ```
 
 ## Testing
